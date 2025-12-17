@@ -7,14 +7,22 @@ use mini_cluster_proto::mini_cluster::worker_service_server::{
     WorkerService, WorkerServiceServer,
 };
 use mini_cluster_proto::mini_cluster::{
-    StatusRequest, StatusUpdate, TaskRequest, TaskSubmitted,
+    ProjectChunk, StatusRequest, StatusUpdate, TaskRequest, TaskSubmitted, UploadAck,
 };
 use sysinfo::System;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{transport::Server, Request, Response, Status};
+
+fn job_archive_path(job_id: &str) -> String {
+    format!("/tmp/fluxa/{job_id}.tar.gz")
+}
+
+fn job_extract_dir(job_id: &str) -> String {
+    format!("/tmp/fluxa/{job_id}")
+}
 
 #[derive(Clone, Debug)]
 struct CurrentState {
@@ -59,22 +67,17 @@ impl WorkerService for WorkerServiceImpl {
 
         tokio::spawn(async move {
             if let Err(e) = run_command(id.clone(), command, workdir, log_tx.clone()).await {
-                let _ = log_tx
-                    .send(format!("task {id} failed: {e:?}"))
-                    .await;
+                let _ = log_tx.send(format!("task {id} failed: {e:?}")).await;
             }
-
             let mut st = state_clone.write().await;
             st.current_task = None;
         });
 
-        let reply = TaskSubmitted {
+        Ok(Response::new(TaskSubmitted {
             id: req.id,
             accepted: true,
             message: "Task accepted".into(),
-        };
-
-        Ok(Response::new(reply))
+        }))
     }
 
     type StreamStatusStream = StatusStream;
@@ -114,6 +117,88 @@ impl WorkerService for WorkerServiceImpl {
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx)) as Self::StreamStatusStream))
     }
+
+    async fn upload_project(
+        &self,
+        request: Request<tonic::Streaming<ProjectChunk>>,
+    ) -> Result<Response<UploadAck>, Status> {
+        let mut stream = request.into_inner();
+
+        tokio::fs::create_dir_all("/tmp/fluxa")
+            .await
+            .map_err(|e| Status::internal(format!("create /tmp/fluxa failed: {e}")))?;
+
+        let mut job_id: Option<String> = None;
+        let mut file: Option<tokio::fs::File> = None;
+        let mut total_bytes: usize = 0;
+
+        while let Some(item) = stream.next().await {
+            let chunk = item.map_err(|e| Status::internal(format!("stream recv error: {e}")))?;
+
+            if job_id.is_none() {
+                if chunk.job_id.trim().is_empty() {
+                    return Err(Status::invalid_argument("job_id is required in first chunk"));
+                }
+                job_id = Some(chunk.job_id.clone());
+
+                let archive_path = job_archive_path(&chunk.job_id);
+                let f = tokio::fs::File::create(&archive_path)
+                    .await
+                    .map_err(|e| Status::internal(format!("create archive failed: {e}")))?;
+                file = Some(f);
+            }
+
+            if let Some(f) = file.as_mut() {
+                f.write_all(&chunk.data)
+                    .await
+                    .map_err(|e| Status::internal(format!("write archive failed: {e}")))?;
+                total_bytes += chunk.data.len();
+            }
+        }
+
+        let job_id = job_id.ok_or_else(|| Status::invalid_argument("no chunks received"))?;
+        drop(file);
+
+        let archive_path = job_archive_path(&job_id);
+        let extract_dir = job_extract_dir(&job_id);
+
+        tokio::fs::create_dir_all(&extract_dir)
+            .await
+            .map_err(|e| Status::internal(format!("create extract dir failed: {e}")))?;
+
+        // Extract with tar
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("tar -xzf '{archive_path}' -C '{extract_dir}'"));
+
+        let status = cmd
+            .status()
+            .await
+            .map_err(|e| Status::internal(format!("tar exec failed: {e}")))?;
+
+        if !status.success() {
+            return Ok(Response::new(UploadAck {
+                job_id,
+                ok: false,
+                message: format!("tar failed: {status}"),
+            }));
+        }
+
+        // Log message visible in client output
+        let _ = self
+            .shared
+            .log_tx
+            .send(format!(
+                "[upload] job={job_id} extracted to {extract_dir} ({total_bytes} bytes)"
+            ))
+            .await;
+
+        Ok(Response::new(UploadAck {
+            job_id,
+            ok: true,
+            message: format!("uploaded and extracted to {extract_dir}"),
+        }))
+    }
 }
 
 async fn run_command(
@@ -147,16 +232,14 @@ async fn run_command(
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let _ = log_tx_clone
-                    .send(format!("[stderr] {line}"))
-                    .await;
+                let _ = log_tx_clone.send(format!("[stderr] {line}")).await;
             }
         });
     }
 
     let status = child.wait().await?;
     let _ = log_tx
-        .send(format!("command {id} exited with: {status}"))
+        .send(format!("command {id} exited with: exit status: {}", status.code().unwrap_or(-1)))
         .await;
 
     Ok(())
@@ -164,13 +247,16 @@ async fn run_command(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::fs::create_dir_all("/tmp/fluxa").await?;
+
     let node_name = hostname::get()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
 
     let sys = Mutex::new(System::new_all());
-    let (log_tx, log_rx) = mpsc::channel::<String>(100);
+    let (log_tx, log_rx) = mpsc::channel::<String>(1000);
+
     let shared = SharedState {
         state: Arc::new(RwLock::new(CurrentState {
             node_name: node_name.clone(),
@@ -182,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_rx: Arc::new(Mutex::new(log_rx)),
     };
 
-    // Task pour mettre à jour CPU/RAM
+    // Update CPU/RAM periodically
     let shared_clone = shared.clone();
     tokio::spawn(async move {
         loop {
@@ -201,7 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         / s.cpus().len() as f32
                 };
 
-                let free_ram = s.available_memory(); // bytes
+                let free_ram = s.available_memory();
 
                 let mut state = shared_clone.state.write().await;
                 state.cpu_usage = cpu_usage;
@@ -214,7 +300,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "0.0.0.0:50051".parse()?;
     let svc = WorkerServiceImpl { shared };
 
-    println!("Worker on {node_name} listening on {addr}");
+    println!("Fluxa worker on {node_name} listening on {addr}");
+
     Server::builder()
         .add_service(WorkerServiceServer::new(svc))
         .serve(addr)

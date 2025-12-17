@@ -9,7 +9,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use mini_cluster_proto::mini_cluster::worker_service_client::WorkerServiceClient;
-use mini_cluster_proto::mini_cluster::{StatusRequest, TaskRequest};
+use mini_cluster_proto::mini_cluster::{ProjectChunk, StatusRequest, TaskRequest, UploadAck};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -24,7 +24,7 @@ use tonic::transport::Channel;
 use uuid::Uuid;
 
 const MAX_LOG_LINES: usize = 2000;
-const TICK_RATE: Duration = Duration::from_millis(33); // ~30fps
+const TICK_RATE: Duration = Duration::from_millis(33);
 const PROMPT: &str = "fluxa> ";
 
 #[derive(Clone, Debug, Default)]
@@ -46,19 +46,15 @@ enum Focus {
 #[derive(Clone, Debug)]
 struct App {
     target: String,
-
-    // status
     status: NodeStatus,
 
-    // output "terminal"
     logs: VecDeque<String>,
     follow_tail: bool,
-    scroll: u16, // vertical scroll offset in lines
+    scroll: u16,
     focus: Focus,
 
-    // input line editor
     input: String,
-    cursor: usize, // byte index in input
+    cursor: usize,
     history: Vec<String>,
     history_idx: Option<usize>,
     message: String,
@@ -312,7 +308,6 @@ async fn start_status_task(target: String, tx: mpsc::UnboundedSender<AppEvent>) 
                 ));
             }
         }
-
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -327,6 +322,41 @@ async fn submit_command(target: String, cmd: String, tx: mpsc::UnboundedSender<A
     };
     let res = client.submit_task(tonic::Request::new(req)).await?.into_inner();
     let msg = format!("submitted {} accepted={} ({})", res.id, res.accepted, res.message);
+    let _ = tx.send(AppEvent::ClientInfo(msg));
+    Ok(())
+}
+
+async fn upload_project(
+    target: String,
+    job_id: String,
+    archive_path: String,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) -> Result<()> {
+    let mut client: WorkerServiceClient<Channel> = WorkerServiceClient::connect(target).await?;
+
+    let data = tokio::fs::read(&archive_path).await?;
+    let total = data.len();
+
+    // IMPORTANT: Stream<Item = ProjectChunk> (pas Result<...>)
+    let chunk_vec: Vec<ProjectChunk> = data
+        .chunks(64 * 1024)
+        .map(|chunk| ProjectChunk {
+            job_id: job_id.clone(),
+            data: chunk.to_vec(),
+        })
+        .collect();
+
+    let stream = tokio_stream::iter(chunk_vec);
+
+    let response = client
+        .upload_project(tonic::Request::new(stream))
+        .await?;
+
+    let ack: UploadAck = response.into_inner();
+    let msg = format!(
+        "upload job={} ok={} ({}) total={} bytes",
+        ack.job_id, ack.ok, ack.message, total
+    );
     let _ = tx.send(AppEvent::ClientInfo(msg));
     Ok(())
 }
@@ -346,7 +376,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         ])
         .split(area);
 
-    // Header
     let header = Paragraph::new(vec![Line::from(vec![
         Span::styled("Fluxa", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("  •  Target: "),
@@ -355,23 +384,14 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     .block(Block::default().borders(Borders::ALL).title("Remote Build / Exec"));
     f.render_widget(header, root[0]);
 
-    // Status
     let conn = if app.status.connected { "connected" } else { "disconnected" };
     let cpu = format!("{:.1}%", app.status.cpu_usage);
     let ram = format!("{:.2} MiB", app.status.free_ram_bytes as f64 / (1024.0 * 1024.0));
-    let task = if app.status.current_task.is_empty() {
-        "idle"
-    } else {
-        app.status.current_task.as_str()
-    };
+    let task = if app.status.current_task.is_empty() { "idle" } else { app.status.current_task.as_str() };
 
     let status_lines = vec![Line::from(format!(
         "Node: {} | {} | CPU: {} | Free RAM: {} | Task: {}",
-        if app.status.node_name.is_empty() {
-            "-"
-        } else {
-            app.status.node_name.as_str()
-        },
+        if app.status.node_name.is_empty() { "-" } else { app.status.node_name.as_str() },
         conn,
         cpu,
         ram,
@@ -381,15 +401,10 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let status = Paragraph::new(status_lines).block(Block::default().borders(Borders::ALL).title("Status"));
     f.render_widget(status, root[1]);
 
-    // Output + scrollbar
     let output_area = root[2];
     app.clamp_scroll(output_area);
 
-    let log_lines: Vec<Line> = app
-        .logs
-        .iter()
-        .map(|l| Line::from(l.as_str()))
-        .collect();
+    let log_lines: Vec<Line> = app.logs.iter().map(|l| Line::from(l.as_str())).collect();
 
     let title = match app.focus {
         Focus::Output => "Output (scroll mode)",
@@ -417,7 +432,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
 
     f.render_stateful_widget(sb, output_area, &mut sb_state);
 
-    // Input
     let input_block_title = match app.focus {
         Focus::Input => "Command (edit mode)",
         Focus::Output => "Command",
@@ -438,9 +452,8 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         f.set_cursor_position((x, y));
     }
 
-    // Status bar
     let follow = if app.follow_tail { "tail" } else { "free" };
-    let help = "Enter: run | Tab: focus | PgUp/PgDn: scroll | End: tail | Ctrl+L: clear | q: quit";
+    let help = "Enter: run | upload <id> <tar.gz> | Tab: focus | PgUp/PgDn: scroll | End: tail | Ctrl+L: clear | q: quit";
     let bar = Line::from(vec![
         Span::styled(
             format!(" {} ", app.message),
@@ -480,17 +493,13 @@ async fn main() -> Result<()> {
 
         match ev_rx.recv().await {
             None => break,
-            Some(AppEvent::Resize) => {
-                terminal.autoresize()?;
-            }
+            Some(AppEvent::Resize) => terminal.autoresize()?,
             Some(AppEvent::Tick) => {
                 if app.follow_tail {
                     app.scroll_to_bottom();
                 }
             }
-            Some(AppEvent::ClientInfo(msg)) => {
-                app.message = msg;
-            }
+            Some(AppEvent::ClientInfo(msg)) => app.message = msg,
             Some(AppEvent::StatusUpdate(st, log)) => {
                 app.status = st;
                 if let Some(line) = log {
@@ -523,11 +532,7 @@ async fn main() -> Result<()> {
                         Focus::Input => Focus::Output,
                         Focus::Output => Focus::Input,
                     };
-                    app.message = if matches!(app.focus, Focus::Input) {
-                        "edit mode".into()
-                    } else {
-                        "scroll mode".into()
-                    };
+                    app.message = if matches!(app.focus, Focus::Input) { "edit mode" } else { "scroll mode" }.into();
                     continue;
                 }
 
@@ -552,24 +557,41 @@ async fn main() -> Result<()> {
                 }
 
                 match k.code {
-                    KeyCode::Esc => {}
                     KeyCode::Enter => {
                         let cmd = app.input.trim().to_string();
                         if cmd.is_empty() {
                             continue;
                         }
-                        app.push_log(format!("{}{}", PROMPT, cmd));
+
+                        app.push_log(format!("{}{}", PROMPT, &cmd));
                         app.commit_history(&cmd);
                         app.input.clear();
                         app.cursor = 0;
 
                         let tx = ev_tx.clone();
                         let tgt = app.target.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = submit_command(tgt, cmd, tx.clone()).await {
-                                let _ = tx.send(AppEvent::ClientInfo(format!("submit failed: {e}")));
+
+                        // Special command: upload <job_id> <archive_path>
+                        if let Some(rest) = cmd.strip_prefix("upload ") {
+                            let parts: Vec<&str> = rest.split_whitespace().collect();
+                            if parts.len() == 2 {
+                                let job_id = parts[0].to_string();
+                                let archive_path = parts[1].to_string();
+                                tokio::spawn(async move {
+                                    if let Err(e) = upload_project(tgt, job_id, archive_path, tx.clone()).await {
+                                        let _ = tx.send(AppEvent::ClientInfo(format!("upload failed: {e}")));
+                                    }
+                                });
+                            } else {
+                                let _ = tx.send(AppEvent::ClientInfo("usage: upload <job_id> <archive.tar.gz>".into()));
                             }
-                        });
+                        } else {
+                            tokio::spawn(async move {
+                                if let Err(e) = submit_command(tgt, cmd, tx.clone()).await {
+                                    let _ = tx.send(AppEvent::ClientInfo(format!("submit failed: {e}")));
+                                }
+                            });
+                        }
                     }
                     KeyCode::Char(c) => app.insert_char(c),
                     KeyCode::Backspace => app.backspace(),

@@ -2,29 +2,74 @@ syntax = "proto3";
 
 package mini_cluster;
 
+// WorkerService manages worker nodes: it accepts submitted tasks and provides
+// synchronous and streaming status updates for a node.
 service WorkerService {
+  // SubmitTask submits a task to a worker node for execution and returns
+  // whether the task was accepted.
   rpc SubmitTask (TaskRequest) returns (TaskSubmitted);
+
+  // StreamStatus opens a server-side streaming RPC that sends continuous
+  // status updates from a worker node.
   rpc StreamStatus (StatusRequest) returns (stream StatusUpdate);
+
+  // Upload a project as a tar.gz blob
+  rpc UploadProject (stream ProjectChunk) returns (UploadAck);
 }
 
+// TaskRequest describes a task to run on a worker node.
 message TaskRequest {
+  // Unique identifier for the task.
   string id = 1;
+
+  // Command to execute on the worker node.
   string command = 2;
+
+  // Working directory in which the command should be executed.
   string workdir = 3;
 }
 
+// TaskSubmitted is returned after attempting to submit a task to a worker.
 message TaskSubmitted {
+  // The task identifier provided in the request.
   string id = 1;
+
+  // Whether the worker accepted the task for execution.
   bool accepted = 2;
+
+  // Optional human-readable message describing acceptance or rejection.
   string message = 3;
 }
 
+// StatusRequest is an (empty) request used to initiate a status stream.
 message StatusRequest {}
 
+// StatusUpdate reports telemetry and activity from a worker node.
 message StatusUpdate {
+  // The name of the reporting node.
   string node_name = 1;
+
+  // Current CPU usage as a percentage (0.0 - 100.0).
   float cpu_usage = 2;
+
+  // Free RAM available on the node, in bytes.
   uint64 free_ram_bytes = 3;
+
+  // Identifier of the task currently running on the node, if any.
   string current_task = 4;
+
+  // Recent log line or status message from the node.
   string log_line = 5;
+}
+
+
+message ProjectChunk {
+  string job_id = 1; // same as TaskRequest.id
+  bytes data = 2; // raw chunk of the archive
+}
+
+message UploadAck {
+  string job_id = 1;
+  bool ok = 2;
+  string message = 3;
 }
