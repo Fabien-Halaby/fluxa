@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.48", features = ["full"] }
-tonic = { version = "0.12", features = ["transport"] }
-mini-cluster-proto = { path = "../proto" }
-tokio-stream = "0.1"
 anyhow = "1"
 crossterm = "0.27"
+mini-cluster-proto = { path = "../proto" }
 ratatui = "0.28"
+tokio = { version = "1.48", features = ["full"] }
+tokio-stream = "0.1"
+tonic = { version = "0.12", features = ["transport"] }
 uuid = { version = "1", features = ["v4"] }

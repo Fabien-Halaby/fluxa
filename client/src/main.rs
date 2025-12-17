@@ -1,8 +1,10 @@
-use std::io::{self};
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::io;
+use std::time::{Duration, Instant};
 
+use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event as CEvent, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -10,100 +12,455 @@ use mini_cluster_proto::mini_cluster::worker_service_client::WorkerServiceClient
 use mini_cluster_proto::mini_cluster::{StatusRequest, TaskRequest};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Terminal,
 };
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
+use tonic::transport::Channel;
 use uuid::Uuid;
 
+const MAX_LOG_LINES: usize = 2000;
+const TICK_RATE: Duration = Duration::from_millis(33); // ~30fps
+const PROMPT: &str = "fluxa> ";
+
 #[derive(Clone, Debug, Default)]
-struct StatusModel {
+struct NodeStatus {
     node_name: String,
     cpu_usage: f32,
     free_ram_bytes: u64,
     current_task: String,
-    logs: Vec<String>, // historique de logs
+    connected: bool,
+    last_seen: Option<Instant>,
 }
 
+#[derive(Clone, Debug)]
+enum Focus {
+    Input,
+    Output,
+}
+
+#[derive(Clone, Debug)]
+struct App {
+    target: String,
+
+    // status
+    status: NodeStatus,
+
+    // output "terminal"
+    logs: VecDeque<String>,
+    follow_tail: bool,
+    scroll: u16, // vertical scroll offset in lines
+    focus: Focus,
+
+    // input line editor
+    input: String,
+    cursor: usize, // byte index in input
+    history: Vec<String>,
+    history_idx: Option<usize>,
+    message: String,
+}
+
+impl App {
+    fn new(target: String) -> Self {
+        Self {
+            target,
+            status: NodeStatus::default(),
+            logs: VecDeque::new(),
+            follow_tail: true,
+            scroll: 0,
+            focus: Focus::Input,
+            input: String::new(),
+            cursor: 0,
+            history: Vec::new(),
+            history_idx: None,
+            message: "Ready".into(),
+        }
+    }
+
+    fn push_log(&mut self, line: String) {
+        if line.is_empty() {
+            return;
+        }
+        self.logs.push_back(line);
+        while self.logs.len() > MAX_LOG_LINES {
+            self.logs.pop_front();
+        }
+        if self.follow_tail {
+            self.scroll_to_bottom();
+        }
+    }
+
+    fn output_height(&self, output_area: Rect) -> usize {
+        output_area.height.saturating_sub(2) as usize
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.scroll = u16::MAX;
+        self.follow_tail = true;
+    }
+
+    fn set_follow_tail(&mut self, follow: bool) {
+        self.follow_tail = follow;
+        if follow {
+            self.scroll_to_bottom();
+        }
+    }
+
+    fn clamp_scroll(&mut self, output_area: Rect) {
+        let visible = self.output_height(output_area);
+        let total = self.logs.len();
+        let max_scroll = total.saturating_sub(visible);
+        let max_scroll_u16 = max_scroll.min(u16::MAX as usize) as u16;
+        if self.scroll > max_scroll_u16 {
+            self.scroll = max_scroll_u16;
+        }
+    }
+
+    fn scroll_up(&mut self, n: u16) {
+        self.follow_tail = false;
+        self.focus = Focus::Output;
+        self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    fn scroll_down(&mut self, n: u16) {
+        self.follow_tail = false;
+        self.focus = Focus::Output;
+        self.scroll = self.scroll.saturating_add(n);
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.input.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.cursor - 1;
+        self.input.remove(prev);
+        self.cursor = prev;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.input.len() {
+            return;
+        }
+        self.input.remove(self.cursor);
+    }
+
+    fn cursor_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+
+    fn cursor_right(&mut self) {
+        if self.cursor < self.input.len() {
+            self.cursor += 1;
+        }
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.input.len();
+    }
+
+    fn commit_history(&mut self, cmd: &str) {
+        if cmd.trim().is_empty() {
+            return;
+        }
+        if self.history.last().map(|s| s.as_str()) != Some(cmd) {
+            self.history.push(cmd.to_string());
+        }
+        self.history_idx = None;
+    }
+
+    fn history_up(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        self.history_idx = Some(match self.history_idx {
+            None => self.history.len().saturating_sub(1),
+            Some(i) => i.saturating_sub(1),
+        });
+        if let Some(i) = self.history_idx {
+            self.input = self.history[i].clone();
+            self.cursor = self.input.len();
+        }
+    }
+
+    fn history_down(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        match self.history_idx {
+            None => {}
+            Some(i) => {
+                let next = i + 1;
+                if next >= self.history.len() {
+                    self.history_idx = None;
+                    self.input.clear();
+                    self.cursor = 0;
+                } else {
+                    self.history_idx = Some(next);
+                    self.input = self.history[next].clone();
+                    self.cursor = self.input.len();
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum AppEvent {
+    Tick,
+    Key(KeyEvent),
+    Resize,
+    StatusUpdate(NodeStatus, Option<String>),
+    ClientInfo(String),
+}
+
+fn start_event_thread(tx: mpsc::UnboundedSender<AppEvent>) {
+    std::thread::spawn(move || {
+        let mut last_tick = Instant::now();
+        loop {
+            let timeout = TICK_RATE.saturating_sub(last_tick.elapsed());
+            if event::poll(timeout).unwrap_or(false) {
+                match event::read() {
+                    Ok(CEvent::Key(k)) => {
+                        let _ = tx.send(AppEvent::Key(k));
+                    }
+                    Ok(CEvent::Resize(_, _)) => {
+                        let _ = tx.send(AppEvent::Resize);
+                    }
+                    _ => {}
+                }
+            }
+            if last_tick.elapsed() >= TICK_RATE {
+                let _ = tx.send(AppEvent::Tick);
+                last_tick = Instant::now();
+            }
+        }
+    });
+}
+
+async fn start_status_task(target: String, tx: mpsc::UnboundedSender<AppEvent>) {
+    loop {
+        match WorkerServiceClient::connect(target.clone()).await {
+            Ok(mut client) => {
+                let mut st = NodeStatus::default();
+                st.connected = true;
+                st.last_seen = Some(Instant::now());
+                let _ = tx.send(AppEvent::StatusUpdate(st.clone(), Some("Connected".into())));
+
+                let req = tonic::Request::new(StatusRequest {});
+                match client.stream_status(req).await {
+                    Ok(mut stream) => {
+                        while let Some(msg) = stream.get_mut().next().await {
+                            match msg {
+                                Ok(update) => {
+                                    st.node_name = update.node_name;
+                                    st.cpu_usage = update.cpu_usage;
+                                    st.free_ram_bytes = update.free_ram_bytes;
+                                    st.current_task = update.current_task;
+                                    st.connected = true;
+                                    st.last_seen = Some(Instant::now());
+
+                                    let log = if update.log_line.is_empty() {
+                                        None
+                                    } else {
+                                        Some(update.log_line)
+                                    };
+                                    let _ = tx.send(AppEvent::StatusUpdate(st.clone(), log));
+                                }
+                                Err(e) => {
+                                    let mut s = NodeStatus::default();
+                                    s.connected = false;
+                                    let _ = tx.send(AppEvent::StatusUpdate(
+                                        s,
+                                        Some(format!("Disconnected: {e}")),
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let mut s = NodeStatus::default();
+                        s.connected = false;
+                        let _ = tx.send(AppEvent::StatusUpdate(
+                            s,
+                            Some(format!("stream_status failed: {e}")),
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                let mut s = NodeStatus::default();
+                s.connected = false;
+                let _ = tx.send(AppEvent::StatusUpdate(
+                    s,
+                    Some(format!("connect failed: {e}")),
+                ));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn submit_command(target: String, cmd: String, tx: mpsc::UnboundedSender<AppEvent>) -> Result<()> {
+    let mut client: WorkerServiceClient<Channel> = WorkerServiceClient::connect(target).await?;
+    let id = Uuid::new_v4().to_string();
+    let req = TaskRequest {
+        id: id.clone(),
+        command: cmd.clone(),
+        workdir: ".".into(),
+    };
+    let res = client.submit_task(tonic::Request::new(req)).await?.into_inner();
+    let msg = format!("submitted {} accepted={} ({})", res.id, res.accepted, res.message);
+    let _ = tx.send(AppEvent::ClientInfo(msg));
+    Ok(())
+}
+
+fn ui(f: &mut ratatui::Frame, app: &mut App) {
+    let area = f.area();
+
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // Header
+    let header = Paragraph::new(vec![Line::from(vec![
+        Span::styled("Fluxa", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("  •  Target: "),
+        Span::styled(app.target.as_str(), Style::default().fg(Color::Yellow)),
+    ])])
+    .block(Block::default().borders(Borders::ALL).title("Remote Build / Exec"));
+    f.render_widget(header, root[0]);
+
+    // Status
+    let conn = if app.status.connected { "connected" } else { "disconnected" };
+    let cpu = format!("{:.1}%", app.status.cpu_usage);
+    let ram = format!("{:.2} MiB", app.status.free_ram_bytes as f64 / (1024.0 * 1024.0));
+    let task = if app.status.current_task.is_empty() {
+        "idle"
+    } else {
+        app.status.current_task.as_str()
+    };
+
+    let status_lines = vec![Line::from(format!(
+        "Node: {} | {} | CPU: {} | Free RAM: {} | Task: {}",
+        if app.status.node_name.is_empty() {
+            "-"
+        } else {
+            app.status.node_name.as_str()
+        },
+        conn,
+        cpu,
+        ram,
+        task
+    ))];
+
+    let status = Paragraph::new(status_lines).block(Block::default().borders(Borders::ALL).title("Status"));
+    f.render_widget(status, root[1]);
+
+    // Output + scrollbar
+    let output_area = root[2];
+    app.clamp_scroll(output_area);
+
+    let log_lines: Vec<Line> = app
+        .logs
+        .iter()
+        .map(|l| Line::from(l.as_str()))
+        .collect();
+
+    let title = match app.focus {
+        Focus::Output => "Output (scroll mode)",
+        Focus::Input => "Output",
+    };
+
+    let output = Paragraph::new(log_lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((app.scroll, 0));
+    f.render_widget(output, output_area);
+
+    let visible = app.output_height(output_area);
+    let total = app.logs.len();
+    let max_scroll = total.saturating_sub(visible);
+    let scroll_pos = app.scroll.min(max_scroll.min(u16::MAX as usize) as u16) as usize;
+
+    let mut sb_state = ScrollbarState::default()
+        .content_length(total.max(1))
+        .position(scroll_pos);
+
+    let sb = Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None);
+
+    f.render_stateful_widget(sb, output_area, &mut sb_state);
+
+    // Input
+    let input_block_title = match app.focus {
+        Focus::Input => "Command (edit mode)",
+        Focus::Output => "Command",
+    };
+
+    let input_line = Line::from(vec![
+        Span::styled(PROMPT, Style::default().fg(Color::Green)),
+        Span::raw(app.input.as_str()),
+    ]);
+
+    let input = Paragraph::new(vec![input_line])
+        .block(Block::default().borders(Borders::ALL).title(input_block_title));
+    f.render_widget(input, root[3]);
+
+    if matches!(app.focus, Focus::Input) {
+        let x = root[3].x + 1 + PROMPT.len() as u16 + app.cursor as u16;
+        let y = root[3].y + 1;
+        f.set_cursor_position((x, y));
+    }
+
+    // Status bar
+    let follow = if app.follow_tail { "tail" } else { "free" };
+    let help = "Enter: run | Tab: focus | PgUp/PgDn: scroll | End: tail | Ctrl+L: clear | q: quit";
+    let bar = Line::from(vec![
+        Span::styled(
+            format!(" {} ", app.message),
+            Style::default().fg(Color::Black).bg(Color::White),
+        ),
+        Span::raw(" "),
+        Span::styled(format!("[{}]", follow), Style::default().fg(Color::Magenta)),
+        Span::raw(" "),
+        Span::styled(help, Style::default().fg(Color::DarkGray)),
+    ]);
+    let bar_widget = Paragraph::new(vec![bar]);
+    f.render_widget(bar_widget, root[4]);
+}
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     let target = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "http://127.0.0.1:50051".to_string());
 
-    let (status_tx, mut status_rx) = mpsc::channel::<StatusModel>(100);
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(10);
-
-    // Task pour écouter StreamStatus
-    let target_clone = target.clone();
-    tokio::spawn(async move {
-        loop {
-            match WorkerServiceClient::connect(target_clone.clone()).await {
-                Ok(mut client) => {
-                    let request = tonic::Request::new(StatusRequest {});
-                    if let Ok(mut stream) = client.stream_status(request).await {
-                        let mut model = StatusModel::default();
-                        while let Some(Ok(update)) = stream.get_mut().next().await {
-                            model.node_name = update.node_name;
-                            model.cpu_usage = update.cpu_usage;
-                            model.free_ram_bytes = update.free_ram_bytes;
-                            model.current_task = update.current_task;
-                            if !update.log_line.is_empty() {
-                                model.logs.push(update.log_line);
-                                // limiter la taille si tu veux, par ex 200 lignes
-                                if model.logs.len() > 200 {
-                                    let to_drop = model.logs.len() - 200;
-                                    model.logs.drain(0..to_drop);
-                                }
-                            }
-                            let _ = status_tx.send(model.clone()).await;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error connecting status stream: {e}");
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
-
-    // Task pour envoyer des commandes (SubmitTask)
-    let target_clone2 = target.clone();
-    tokio::spawn(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            match WorkerServiceClient::connect(target_clone2.clone()).await {
-                Ok(mut client) => {
-                    let id = Uuid::new_v4().to_string();
-                    let req = TaskRequest {
-                        id: id.clone(),
-                        command: cmd.clone(),
-                        workdir: ".".into(),
-                    };
-                    let request = tonic::Request::new(req);
-                    match client.submit_task(request).await {
-                        Ok(resp) => {
-                            let r = resp.into_inner();
-                            println!("Task submitted: {} ({})", r.id, r.message);
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to submit task: {e}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to connect for submit: {e}");
-                }
-            }
-        }
-    });
-
-    // TUI
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -111,102 +468,127 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut current_status = StatusModel::default();
-    let mut input = String::new();
+    let mut app = App::new(target.clone());
+
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<AppEvent>();
+
+    start_event_thread(ev_tx.clone());
+    tokio::spawn(start_status_task(target.clone(), ev_tx.clone()));
 
     loop {
-        // Met à jour le modèle si on a des nouvelles
-        while let Ok(status) = status_rx.try_recv() {
-            current_status = status;
-        }
+        terminal.draw(|f| ui(f, &mut app))?;
 
-        terminal.draw(|f| {
-            let area = f.area();
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints(
-                    [
-                        Constraint::Length(3), // header
-                        Constraint::Length(3), // status
-                        Constraint::Min(3),    // logs + input
-                    ]
-                    .as_ref(),
-                )
-                .split(area);
-            
-            // Header
-            let header_text = vec![Line::from(vec![
-                Span::raw("Target: "),
-                Span::styled(&target, Style::default().fg(Color::Cyan)),
-            ])];
-            let header = Paragraph::new(header_text)
-                .block(Block::default().borders(Borders::ALL).title("Mini Cluster Client"));
-            f.render_widget(header, chunks[0]);
-            
-            // Status
-            let status_text = vec![Line::from(format!(
-                "Node: {} | CPU: {:.1}% | Free RAM: {:.2} MiB | Task: {}",
-                current_status.node_name,
-                current_status.cpu_usage,
-                current_status.free_ram_bytes as f64 / (1024.0 * 1024.0),
-                current_status.current_task
-            ))];
-            let status_widget = Paragraph::new(status_text)
-                .block(Block::default().borders(Borders::ALL).title("Status"));
-            f.render_widget(status_widget, chunks[1]);
-        
-            // Zone terminal (logs + input)
-            let logs_area = chunks[2];
-            let logs_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(
-                    [
-                        Constraint::Min(3),   // logs
-                        Constraint::Length(3) // input
-                    ]
-                    .as_ref(),
-                )
-                .split(logs_area);
-            
-            // Logs comme un vrai terminal
-            let log_lines: Vec<Line> = current_status
-                .logs
-                .iter()
-                .map(|l| Line::from(l.as_str()))
-                .collect();
-            
-            let logs_widget = Paragraph::new(log_lines)
-                .block(Block::default().borders(Borders::ALL).title("Worker output"));
-            f.render_widget(logs_widget, logs_chunks[0]);
-            
-            // Input
-            let input_text: String = input.clone();
-            let input_widget = Paragraph::new(input_text)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Command to run on worker (Enter to submit, q to quit)"),
-                );
-            f.render_widget(input_widget, logs_chunks[1]);
-        })?;
+        match ev_rx.recv().await {
+            None => break,
+            Some(AppEvent::Resize) => {
+                terminal.autoresize()?;
+            }
+            Some(AppEvent::Tick) => {
+                if app.follow_tail {
+                    app.scroll_to_bottom();
+                }
+            }
+            Some(AppEvent::ClientInfo(msg)) => {
+                app.message = msg;
+            }
+            Some(AppEvent::StatusUpdate(st, log)) => {
+                app.status = st;
+                if let Some(line) = log {
+                    app.push_log(line);
+                }
+            }
+            Some(AppEvent::Key(k)) => {
+                if k.modifiers.is_empty() && k.code == KeyCode::Char('q') {
+                    break;
+                }
 
-        if crossterm::event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Enter => {
-                        let cmd = input.trim().to_string();
-                        if !cmd.is_empty() {
-                            let _ = cmd_tx.send(cmd).await;
+                if k.modifiers.contains(KeyModifiers::CONTROL) {
+                    match k.code {
+                        KeyCode::Char('l') => {
+                            app.logs.clear();
+                            app.scroll = 0;
+                            app.set_follow_tail(true);
+                            app.message = "cleared output".into();
                         }
-                        input.clear();
+                        KeyCode::Char('c') => {
+                            app.push_log("[client] Ctrl+C pressed (cancel not implemented yet)".into());
+                        }
+                        _ => {}
                     }
-                    KeyCode::Backspace => {
-                        input.pop();
+                    continue;
+                }
+
+                if k.code == KeyCode::Tab {
+                    app.focus = match app.focus {
+                        Focus::Input => Focus::Output,
+                        Focus::Output => Focus::Input,
+                    };
+                    app.message = if matches!(app.focus, Focus::Input) {
+                        "edit mode".into()
+                    } else {
+                        "scroll mode".into()
+                    };
+                    continue;
+                }
+
+                if matches!(app.focus, Focus::Output) {
+                    match k.code {
+                        KeyCode::Esc => {
+                            app.focus = Focus::Input;
+                            app.message = "edit mode".into();
+                        }
+                        KeyCode::Up => app.scroll_up(1),
+                        KeyCode::Down => app.scroll_down(1),
+                        KeyCode::PageUp => app.scroll_up(10),
+                        KeyCode::PageDown => app.scroll_down(10),
+                        KeyCode::End => {
+                            app.set_follow_tail(true);
+                            app.focus = Focus::Input;
+                            app.message = "tail mode".into();
+                        }
+                        _ => {}
                     }
-                    KeyCode::Char(c) => {
-                        input.push(c);
+                    continue;
+                }
+
+                match k.code {
+                    KeyCode::Esc => {}
+                    KeyCode::Enter => {
+                        let cmd = app.input.trim().to_string();
+                        if cmd.is_empty() {
+                            continue;
+                        }
+                        app.push_log(format!("{}{}", PROMPT, cmd));
+                        app.commit_history(&cmd);
+                        app.input.clear();
+                        app.cursor = 0;
+
+                        let tx = ev_tx.clone();
+                        let tgt = app.target.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = submit_command(tgt, cmd, tx.clone()).await {
+                                let _ = tx.send(AppEvent::ClientInfo(format!("submit failed: {e}")));
+                            }
+                        });
+                    }
+                    KeyCode::Char(c) => app.insert_char(c),
+                    KeyCode::Backspace => app.backspace(),
+                    KeyCode::Delete => app.delete(),
+                    KeyCode::Left => app.cursor_left(),
+                    KeyCode::Right => app.cursor_right(),
+                    KeyCode::Home => app.home(),
+                    KeyCode::End => app.end(),
+                    KeyCode::Up => app.history_up(),
+                    KeyCode::Down => app.history_down(),
+                    KeyCode::PageUp => {
+                        app.focus = Focus::Output;
+                        app.scroll_up(10);
+                        app.message = "scroll mode".into();
+                    }
+                    KeyCode::PageDown => {
+                        app.focus = Focus::Output;
+                        app.scroll_down(10);
+                        app.message = "scroll mode".into();
                     }
                     _ => {}
                 }
@@ -217,6 +599,5 @@ async fn main() -> anyhow::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
     Ok(())
 }
