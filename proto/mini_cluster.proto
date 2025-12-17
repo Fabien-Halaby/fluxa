@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package mini_cluster;
+
+service WorkerService {
+  rpc SubmitTask (TaskRequest) returns (TaskSubmitted);
+  rpc StreamStatus (StatusRequest) returns (stream StatusUpdate);
+}
+
+message TaskRequest {
+  string id = 1;
+  string command = 2;
+  string workdir = 3;
+}
+
+message TaskSubmitted {
+  string id = 1;
+  bool accepted = 2;
+  string message = 3;
+}
+
+message StatusRequest {}
+
+message StatusUpdate {
+  string node_name = 1;
+  float cpu_usage = 2;
+  uint64 free_ram_bytes = 3;
+  string current_task = 4;
+  string log_line = 5;
+}

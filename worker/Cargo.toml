@@ -1,0 +1,13 @@
+[package]
+name = "mini-cluster-worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.48", features = ["full"] }
+tonic = { version = "0.12", features = ["transport"] }
+mini-cluster-proto = { path = "../proto" }
+sysinfo = "0.30"
+tokio-stream = "0.1"
+anyhow = "1"
+hostname = "0.3"
