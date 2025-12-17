@@ -26,8 +26,9 @@ struct StatusModel {
     cpu_usage: f32,
     free_ram_bytes: u64,
     current_task: String,
-    last_log: String,
+    logs: Vec<String>, // historique de logs
 }
+
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -53,7 +54,12 @@ async fn main() -> anyhow::Result<()> {
                             model.free_ram_bytes = update.free_ram_bytes;
                             model.current_task = update.current_task;
                             if !update.log_line.is_empty() {
-                                model.last_log = update.log_line;
+                                model.logs.push(update.log_line);
+                                // limiter la taille si tu veux, par ex 200 lignes
+                                if model.logs.len() > 200 {
+                                    let to_drop = model.logs.len() - 200;
+                                    model.logs.drain(0..to_drop);
+                                }
                             }
                             let _ = status_tx.send(model.clone()).await;
                         }
@@ -121,14 +127,15 @@ async fn main() -> anyhow::Result<()> {
                 .margin(1)
                 .constraints(
                     [
-                        Constraint::Length(3),
-                        Constraint::Length(3),
-                        Constraint::Min(3),
+                        Constraint::Length(3), // header
+                        Constraint::Length(3), // status
+                        Constraint::Min(3),    // logs + input
                     ]
                     .as_ref(),
                 )
                 .split(area);
             
+            // Header
             let header_text = vec![Line::from(vec![
                 Span::raw("Target: "),
                 Span::styled(&target, Style::default().fg(Color::Cyan)),
@@ -137,21 +144,43 @@ async fn main() -> anyhow::Result<()> {
                 .block(Block::default().borders(Borders::ALL).title("Mini Cluster Client"));
             f.render_widget(header, chunks[0]);
             
-            let status_text = vec![
-                Line::from(format!(
-                    "Node: {} | CPU: {:.1}% | Free RAM: {:.2} MiB | Task: {}",
-                    current_status.node_name,
-                    current_status.cpu_usage,
-                    current_status.free_ram_bytes as f64 / (1024.0 * 1024.0),
-                    current_status.current_task
-                )),
-                Line::from(format!("Last log: {}", current_status.last_log)),
-            ];
+            // Status
+            let status_text = vec![Line::from(format!(
+                "Node: {} | CPU: {:.1}% | Free RAM: {:.2} MiB | Task: {}",
+                current_status.node_name,
+                current_status.cpu_usage,
+                current_status.free_ram_bytes as f64 / (1024.0 * 1024.0),
+                current_status.current_task
+            ))];
             let status_widget = Paragraph::new(status_text)
                 .block(Block::default().borders(Borders::ALL).title("Status"));
             f.render_widget(status_widget, chunks[1]);
+        
+            // Zone terminal (logs + input)
+            let logs_area = chunks[2];
+            let logs_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(
+                    [
+                        Constraint::Min(3),   // logs
+                        Constraint::Length(3) // input
+                    ]
+                    .as_ref(),
+                )
+                .split(logs_area);
             
-            // ⬇⬇⬇ MODIF ICI
+            // Logs comme un vrai terminal
+            let log_lines: Vec<Line> = current_status
+                .logs
+                .iter()
+                .map(|l| Line::from(l.as_str()))
+                .collect();
+            
+            let logs_widget = Paragraph::new(log_lines)
+                .block(Block::default().borders(Borders::ALL).title("Worker output"));
+            f.render_widget(logs_widget, logs_chunks[0]);
+            
+            // Input
             let input_text: String = input.clone();
             let input_widget = Paragraph::new(input_text)
                 .block(
@@ -159,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
                         .borders(Borders::ALL)
                         .title("Command to run on worker (Enter to submit, q to quit)"),
                 );
-            f.render_widget(input_widget, chunks[2]);
+            f.render_widget(input_widget, logs_chunks[1]);
         })?;
 
         if crossterm::event::poll(Duration::from_millis(200))? {
